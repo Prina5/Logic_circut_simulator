@@ -1,0 +1,422 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Logic Circut Simulator</title>
+
+  <!-- Simple CSS styles and body of web app -->
+  <style>
+    :root{--accent:#2b8cff;--bg:#f6f9ff;--card:#ffffff}
+    body{font-family:Inter,Segoe UI,Roboto,Arial;margin:0;background:var(--bg);color:#0b1220}
+    header{background:linear-gradient(90deg,var(--accent),#6dd3ff);padding:20px;color:white}
+    .wrap{max-width:1100px;margin:18px auto;padding:18px}
+    .controls{display:flex;gap:10px;align-items:flex-start;flex-wrap:wrap}
+    input[type=text]{flex:1;padding:10px;border-radius:8px;border:1px solid #d6e6ff;min-width:240px}
+    button{padding:10px 14px;border-radius:8px;border:0;background:var(--accent);color:white;cursor:pointer}
+    .pane{display:grid;grid-template-columns:1fr 520px;gap:16px;margin-top:16px}
+    .card{background:var(--card);padding:14px;border-radius:10px;box-shadow:0 4px 12px rgba(11,18,32,0.06)}
+    pre, table{font-family:ui-monospace,monospace;font-size:13px}
+    table{border-collapse:collapse;width:100%}
+    th,td{border:1px solid #eef6ff;padding:6px;text-align:center}
+    th{background:#f0f7ff}
+    #svgWrap{overflow:auto;border:1px dashed #e6f0ff;padding:8px;border-radius:8px;height:420px;background:white}
+    .small{font-size:13px;color:#334155}
+    footer{margin-top:18px;text-align:center;color:#475569;font-size:13px}
+    .error{color:#b91c1c}
+  </style>
+
+</head>
+<body>
+  <header>
+    <div class="wrap">
+      <h1 style="margin:0">Logic Circuit Simulator </h1>
+      <p style="margin:6px 0 0;opacity:.95">Enter boolean expressions (operators: <strong>NOT</strong>, <strong>AND</strong>, <strong>OR</strong>; parentheses allowed). Variables: letters, digits and underscore, must start with a letter.</p>
+    </div>
+  </header>
+
+  <main class="wrap">
+    <div class="controls card">
+      <input id="expr" type="text" value="NOT (p AND q) OR r" placeholder="e.g. NOT (p AND q) OR r" />
+      <button id="run">Generate</button>
+      <button id="openSvg">Open Raw SVG</button>
+      <button id="downloadSvg">Download SVG</button>
+      <button id="exportPng">Download PNG</button>
+      <div style="margin-left:12px" class="small">Operators are case-insensitive. Example variables: p, q1, A_b</div>
+    </div>
+
+    <div class="pane">
+      <div class="card" style="min-height:520px">
+        <h3>Truth Table</h3>
+        <div id="tableWrap" class="small"></div>
+        <div id="error" class="error"></div>
+      </div>
+
+      <div class="card">
+        <h3>Circuit Diagram (SVG)</h3>
+        <div id="svgWrap"><svg id="circuitSvg" xmlns="http://www.w3.org/2000/svg" width="100%" height="400"></svg></div>
+        <div class="small" style="margin-top:8px">Use <strong>Open Raw SVG</strong> to view the raw SVG or <strong>Download PNG</strong> to save an image. If PNG fails, try downloading the SVG and converting with an external tool.</div>
+      </div>
+    </div>
+
+    <footer>Built with  HTML, CSS & JavaScript — parser, AST, truth table generator and SVG renderer included.</footer>
+  </main>
+
+<script>
+/*
+ Tokenizer & Parser (Shunting-yard -> RPN -> AST)
+ Operators: NOT (unary, highest), AND, OR (lowest)
+*/
+const OPS = {
+  'NOT': {prec: 3, assoc: 'right', args:1},
+  'AND': {prec: 2, assoc: 'left', args:2},
+  'OR':  {prec: 1, assoc: 'left', args:2}
+};
+
+// safer token regex: capture operators/parentheses or valid variable names
+function tokenize(s){
+  const tokens = [];
+  const re = /\s*(AND|OR|NOT|\(|\)|[A-Za-z][A-Za-z0-9_]*)\s*/ig;
+  let m;
+  let lastIndex = 0;
+  while((m = re.exec(s)) !== null){
+    if(m.index !== lastIndex){
+      // there is some unsupported text between matches
+      const leftover = s.slice(lastIndex, m.index).trim();
+      if(leftover) throw new Error('Unexpected token near: ' + leftover);
+    }
+    const t = m[1];
+    lastIndex = re.lastIndex;
+    const up = t.toUpperCase();
+    if(up === 'AND' || up === 'OR' || up === 'NOT') tokens.push({type:'op', val: up});
+    else if(t === '(' || t === ')') tokens.push({type: t});
+    else tokens.push({type:'var', val: t});
+  }
+  // leftover after last match?
+  if(lastIndex !== s.length){
+    const leftover = s.slice(lastIndex).trim();
+    if(leftover) throw new Error('Unexpected token near: ' + leftover);
+  }
+  return tokens;
+}
+
+function toRPN(tokens){
+  const out = [];
+  const st = [];
+  for(let i=0;i<tokens.length;i++){
+    const t = tokens[i];
+    if(t.type === 'var') out.push(t);
+    else if(t.type === 'op'){
+      const o1 = t.val;
+      while(st.length){
+        const top = st[st.length-1];
+        if(top.type !== 'op') break;
+        const o2 = top.val;
+        if( (OPS[o1].assoc === 'left' && OPS[o1].prec <= OPS[o2].prec) ||
+            (OPS[o1].assoc === 'right' && OPS[o1].prec < OPS[o2].prec) ){
+          out.push(st.pop());
+        } else break;
+      }
+      st.push(t);
+    } else if(t.type === '(') { st.push(t); }
+    else if(t.type === ')'){
+      while(st.length && st[st.length-1].type !== '(') out.push(st.pop());
+      if(!st.length) throw new Error('Mismatched parentheses');
+      st.pop();
+    }
+  }
+  while(st.length){
+    const tt = st.pop();
+    if(tt.type === '(' || tt.type === ')') throw new Error('Mismatched parentheses');
+    out.push(tt);
+  }
+  return out;
+}
+
+function rpnToAST(rpn){
+  const st = [];
+  for(const t of rpn){
+    if(t.type === 'var') st.push({type:'var', name: t.val});
+    else if(t.type === 'op'){
+      const meta = OPS[t.val];
+      if(meta.args === 1){
+        const a = st.pop(); if(!a) throw new Error('Missing operand for ' + t.val);
+        st.push({type:'op', op: t.val, children: [a]});
+      } else {
+        const b = st.pop(); const a = st.pop(); if(!a || !b) throw new Error('Missing operands for ' + t.val);
+        st.push({type:'op', op: t.val, children: [a, b]});
+      }
+    }
+  }
+  if(st.length !== 1) throw new Error('Invalid expression');
+  return st[0];
+}
+
+function parseExpression(s){
+  const tokens = tokenize(s);
+  const rpn = toRPN(tokens);
+  const ast = rpnToAST(rpn);
+  return ast;
+}
+
+// ------------------ AST evaluation & variable extraction ------------------
+function collectVars(ast, set){
+  set = set || new Set();
+  if(ast.type === 'var') set.add(ast.name);
+  else for(const c of ast.children) collectVars(c, set);
+  return set;
+}
+
+function evalAST(ast, env){
+  if(ast.type === 'var'){
+    if(!(ast.name in env)) throw new Error('Unknown variable: ' + ast.name);
+    return !!env[ast.name];
+  }
+  const op = ast.op;
+  if(op === 'NOT') return !evalAST(ast.children[0], env);
+  if(op === 'AND') return evalAST(ast.children[0], env) && evalAST(ast.children[1], env);
+  if(op === 'OR')  return evalAST(ast.children[0], env) || evalAST(ast.children[1], env);
+  throw new Error('Unknown op: ' + op);
+}
+
+// ------------------ Truth table generator ------------------
+function generateTruthTable(ast){
+  const vars = Array.from(collectVars(ast)).sort((a,b)=>a.localeCompare(b));
+  const n = vars.length;
+  const rows = [];
+  if(n === 0){
+    // expression with no vars: evaluate once
+    const out = !!evalAST(ast, {});
+    rows.push({env: {}, out});
+    return {vars, rows};
+  }
+  const total = 1 << n;
+  for(let i=0;i<total;i++){
+    const env = {};
+    for(let j=0;j<n;j++) env[vars[j]] = !!(i & (1 << (n-1-j)));
+    const out = !!evalAST(ast, env);
+    rows.push({env, out});
+  }
+  return {vars, rows};
+}
+
+// ------------------ Simple SVG circuit renderer ------------------
+function measureWidths(node){
+  if(node.type === 'var'){ node.width = 80; node.height = 28; node.leaves = 1; return node.width; }
+  if(node.op === 'NOT'){ node.width = 60; node.height = 34; node.leaves = measureWidths(node.children[0]); return node.width; }
+  const left = node.children[0], right = node.children[1];
+  const lw = measureWidths(left), rw = measureWidths(right);
+  node.leaves = left.leaves + right.leaves;
+  node.width = Math.max(140, lw + rw + 40); node.height = 44; return node.width;
+}
+
+function layout(node, x, y){
+  node.x = x; node.y = y;
+  if(node.type === 'var') return;
+  if(node.op === 'NOT'){
+    layout(node.children[0], x, y + 90);
+    return;
+  }
+  const left = node.children[0], right = node.children[1];
+  const total = left.leaves + right.leaves;
+  const leftWidth = (left.leaves / total) * (node.width - 20);
+  const leftCenter = x - node.width/2 + leftWidth/2 + 10;
+  const rightCenter = x + node.width/2 - (node.width - leftWidth)/2 - 10;
+  layout(left, leftCenter, y + 90);
+  layout(right, rightCenter, y + 90);
+}
+
+function drawCircuitSVG(ast, svgEl){
+  // Clear
+  while(svgEl.firstChild) svgEl.removeChild(svgEl.firstChild);
+
+  // compute sizes
+  measureWidths(ast);
+  const W = Math.max(520, Math.ceil(ast.width + 80));
+  const H = Math.max(380, Math.ceil(220 + (ast.leaves * 60)));
+  svgEl.setAttribute('viewBox', `0 0 ${W} ${H}`);
+  svgEl.setAttribute('width', '100%');
+  svgEl.setAttribute('height', '400');
+
+  // layout root at center top
+  layout(ast, W/2, 40);
+  const ns = 'http://www.w3.org/2000/svg';
+
+  // draw edges first
+  const groupEdges = document.createElementNS(ns,'g');
+  groupEdges.setAttribute('stroke','#0b1220');
+  groupEdges.setAttribute('stroke-width','1.6');
+  groupEdges.setAttribute('fill','none');
+  svgEl.appendChild(groupEdges);
+
+  function connect(parent, child){
+    const x1 = parent.x; const y1 = parent.y + (parent.op ? 18 : 14);
+    const x2 = child.x; const y2 = child.y - (child.op ? 18 : 14);
+    const path = document.createElementNS(ns,'path');
+    const dx = Math.max(10, Math.abs(x2-x1)/2);
+    const d = `M ${x1} ${y1} C ${x1} ${y1+dx} ${x2} ${y2-dx} ${x2} ${y2}`;
+    path.setAttribute('d', d);
+    path.setAttribute('stroke-linecap','round');
+    groupEdges.appendChild(path);
+  }
+  function generateShareLink() {
+    const expr = document.getElementById("logicInput").value;
+    const encoded = encodeURIComponent(expr);
+
+    const shareURL = `${window.location.origin}${window.location.pathname}?expr=${encoded}`;
+    return shareURL;
+}
+
+
+  function drawNode(node){
+    if(node.type === 'var'){
+      const g = document.createElementNS(ns,'g');
+      const w = 78, h = 24;
+      const rx = node.x - w/2, ry = node.y - h/2;
+      const rect = document.createElementNS(ns,'rect'); rect.setAttribute('x', rx); rect.setAttribute('y', ry);
+      rect.setAttribute('width', w); rect.setAttribute('height', h); rect.setAttribute('rx', 6);
+      rect.setAttribute('fill', '#fff'); rect.setAttribute('stroke', '#124e8c'); rect.setAttribute('stroke-width', '1.6');
+      const txt = document.createElementNS(ns,'text'); txt.setAttribute('x', node.x); txt.setAttribute('y', node.y + 5);
+      txt.setAttribute('text-anchor', 'middle'); txt.setAttribute('font-size', '13'); txt.textContent = node.name;
+      g.appendChild(rect); g.appendChild(txt);
+      svgEl.appendChild(g);
+      return;
+    }
+    const g = document.createElementNS(ns,'g');
+    const cx = node.x, cy = node.y;
+    const circle = document.createElementNS(ns,'circle'); circle.setAttribute('cx', cx); circle.setAttribute('cy', cy);
+    circle.setAttribute('r', 18); circle.setAttribute('fill', '#fff'); circle.setAttribute('stroke', '#0b1220'); circle.setAttribute('stroke-width', '1.6');
+    const label = document.createElementNS(ns,'text'); label.setAttribute('x', cx); label.setAttribute('y', cy + 5); label.setAttribute('text-anchor', 'middle'); label.setAttribute('font-size', '11'); label.textContent = node.op;
+    g.appendChild(circle); g.appendChild(label);
+    svgEl.appendChild(g);
+
+    if(node.op === 'NOT'){
+      connect(node, node.children[0]);
+      drawNode(node.children[0]);
+      return;
+    }
+    connect(node, node.children[0]); connect(node, node.children[1]);
+    drawNode(node.children[0]); drawNode(node.children[1]);
+  }
+  drawNode(ast);
+
+  // output label at bottom right
+  const outTxt = document.createElementNS(ns,'text'); outTxt.setAttribute('x', W - 12); outTxt.setAttribute('y', H - 8);
+  outTxt.setAttribute('text-anchor','end'); outTxt.setAttribute('font-size','11'); outTxt.setAttribute('fill','#333'); outTxt.textContent = 'OUT';
+  svgEl.appendChild(outTxt);
+}
+
+//  UI wiring
+const exprInput = document.getElementById('expr');
+const runBtn = document.getElementById('run');
+const tableWrap = document.getElementById('tableWrap');
+const svgEl = document.getElementById('circuitSvg');
+const errorDiv = document.getElementById('error');
+const openSvgBtn = document.getElementById('openSvg');
+const downloadSvgBtn = document.getElementById('downloadSvg');
+const exportPngBtn = document.getElementById('exportPng');
+
+function render(){
+  errorDiv.textContent = ''; tableWrap.innerHTML = '';
+  const s = exprInput.value.trim(); if(!s){ errorDiv.textContent='Please enter an expression.'; return; }
+  let ast;
+  try{ ast = parseExpression(s); }
+  catch(e){ errorDiv.textContent = 'Parse error: ' + (e.message || e); return; }
+
+  // truth table
+  try{
+    const tt = generateTruthTable(ast);
+    const table = document.createElement('table');
+    const thead = document.createElement('thead'); const thr = document.createElement('tr');
+    for(const v of tt.vars){ const th = document.createElement('th'); th.textContent = v; thr.appendChild(th); }
+    const tho = document.createElement('th'); tho.textContent='OUT'; thr.appendChild(tho); thead.appendChild(thr); table.appendChild(thead);
+    const tbody = document.createElement('tbody');
+    for(const r of tt.rows){
+      const tr = document.createElement('tr');
+      for(const v of tt.vars){ const td = document.createElement('td'); td.textContent = r.env[v] ? '1' : '0'; tr.appendChild(td); }
+      const td = document.createElement('td'); td.textContent = r.out ? '1' : '0'; tr.appendChild(td); tbody.appendChild(tr);
+    }
+    table.appendChild(tbody);
+    tableWrap.appendChild(table);
+  } catch(e){ errorDiv.textContent = 'Evaluation error: ' + (e.message || e); }
+
+  // draw circuit
+  try{ drawCircuitSVG(ast, svgEl); }
+  catch(e){ errorDiv.textContent = 'Render error: ' + (e.message || e); }
+}
+
+// get serialized SVG string but ensure explicit numeric width/height (for PNG rasterization)
+function getSerializedSvgForExport(svgNode){
+  const clone = svgNode.cloneNode(true);
+  // derive numeric width/height from viewBox if present
+  const viewBox = clone.getAttribute('viewBox');
+  if(viewBox){
+    const parts = viewBox.split(/\s+/).map(Number);
+    if(parts.length === 4 && parts.every(n => !isNaN(n))){
+      const w = Math.ceil(parts[2]); const h = Math.ceil(parts[3]);
+      clone.setAttribute('width', String(w));
+      clone.setAttribute('height', String(h));
+    }
+  }
+  // ensure xmlns exists
+  if(!clone.getAttribute('xmlns')) clone.setAttribute('xmlns','http://www.w3.org/2000/svg');
+  const svgData = new XMLSerializer().serializeToString(clone);
+  return svgData;
+}
+
+openSvgBtn.addEventListener('click', ()=>{
+  try{
+    const svgData = getSerializedSvgForExport(svgEl);
+    const blob = new Blob([svgData], {type:'image/svg+xml;charset=utf-8'});
+    const url = URL.createObjectURL(blob);
+    window.open(url, '_blank');
+  } catch(e){ alert('Could not open SVG: ' + e.message); }
+});
+
+downloadSvgBtn.addEventListener('click', ()=>{
+  try{
+    const svgData = getSerializedSvgForExport(svgEl);
+    const blob = new Blob([svgData], {type:'image/svg+xml;charset=utf-8'});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a'); a.href = url; a.download = 'circuit.svg'; document.body.appendChild(a);
+    a.click(); a.remove(); URL.revokeObjectURL(url);
+  } catch(e){ alert('Could not download SVG: ' + e.message); }
+});
+
+exportPngBtn.addEventListener('click', ()=>{
+  try{
+    const svgData = getSerializedSvgForExport(svgEl);
+    const svgBlob = new Blob([svgData], {type:'image/svg+xml;charset=utf-8'});
+    const url = URL.createObjectURL(svgBlob);
+    const img = new Image();
+    img.onload = function(){
+      const canvas = document.createElement('canvas');
+      // use image intrinsic size
+      canvas.width = img.width || 1000;
+      canvas.height = img.height || 600;
+      const ctx = canvas.getContext('2d');
+      // white background for PNG
+      ctx.fillStyle = '#ffffff'; ctx.fillRect(0,0,canvas.width,canvas.height);
+      ctx.drawImage(img,0,0,canvas.width,canvas.height);
+      URL.revokeObjectURL(url);
+      canvas.toBlob(function(blob){
+        const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'circuit.png'; a.click();
+      }, 'image/png');
+    };
+    img.onerror = function(){
+      alert('Failed to render PNG (SVG may include fonts or unsupported constructs). Try Download SVG and convert with an external tool.');
+      URL.revokeObjectURL(url);
+    };
+    img.src = url;
+  } catch(e){ alert('PNG export failed: ' + e.message); }
+});
+
+// keyboard enter
+runBtn.addEventListener('click', render);
+exprInput.addEventListener('keydown', (e)=>{ if(e.key === 'Enter') render(); });
+
+// initial render
+render();
+</script>
+</body>
+</html>
